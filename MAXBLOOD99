@@ -1,0 +1,365 @@
+from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
+import math
+import random
+
+# ---------- Vec3 helper ----------
+class Vec3:
+    def __init__(self, x=0, y=0, z=0):
+        if hasattr(x, 'x'):
+            self.x = x.x
+            self.y = x.y
+            self.z = x.z
+        else:
+            self.x = x
+            self.y = y
+            self.z = z
+
+    def __sub__(self, other):
+        return Vec3(self.x - other.x, self.y - other.y, self.z - other.z)
+
+    def __add__(self, other):
+        return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
+
+    def __mul__(self, val):
+        return Vec3(self.x * val, self.y * val, self.z * val)
+
+    def dot(self, other):
+        return self.x * other.x + self.y * other.y + self.z * other.z
+
+    def length(self):
+        return math.sqrt(self.x*self.x + self.y*self.y + self.z*self.z)
+
+    def normalize(self):
+        l = self.length()
+        if l == 0:
+            return Vec3(0,0,0)
+        return Vec3(self.x/l, self.y/l, self.z/l)
+
+def sign(x):
+    return 1 if x >= 0 else -1
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+# ---------- Aerial controller ----------
+class AerialController:
+    def steer_toward(self, bot, car, target: Vec3):
+        car_pos = Vec3(car.physics.location)
+        car_rot = car.physics.rotation
+        car_yaw = car_rot.yaw
+        car_pitch = car_rot.pitch
+        car_roll = car_rot.roll
+
+        to_target = (target - car_pos).normalize()
+
+        desired_yaw = math.atan2(to_target.y, to_target.x)
+        desired_pitch = math.atan2(to_target.z, math.sqrt(to_target.x**2 + to_target.y**2))
+
+        yaw_error = (desired_yaw - car_yaw + math.pi) % (2*math.pi) - math.pi
+        pitch_error = (desired_pitch - car_pitch + math.pi) % (2*math.pi) - math.pi
+
+        bot.controller.yaw = clamp(yaw_error * 2.0, -1, 1)
+        bot.controller.pitch = clamp(-pitch_error * 2.0, -1, 1)
+        bot.controller.roll = clamp(-car_roll * 1.5, -1, 1)
+
+# ---------- Flip Reset Freestyler ----------
+class FlipResetFreestylerRoutine:
+    def __init__(self):
+        self.phase = 0
+        self.timer = 0
+        self.has_reset = False
+        self.reset_count = 0
+        self.aerial = AerialController()
+
+    def run(self, bot, car, ball):
+        dt = 1/120
+        self.timer += dt
+        bot.controller.boost = True
+
+        ball_pos = Vec3(ball.physics.location)
+        car_pos = Vec3(car.physics.location)
+
+        if self.phase == 0:
+            target = Vec3(ball_pos.x, ball_pos.y, ball_pos.z - 80)
+            self.aerial.steer_toward(bot, car, target)
+            if ball_pos.z > 400 and car_pos.z > 200:
+                self.phase = 1
+                self.timer = 0
+
+        elif self.phase == 1:
+            target = Vec3(ball_pos.x, ball_pos.y, ball_pos.z - 60)
+            self.aerial.steer_toward(bot, car, target)
+            dist = (ball_pos - car_pos).length()
+
+            if not self.has_reset and dist < 120:
+                self.has_reset = True
+                self.reset_count += 1
+                self.timer = 0
+
+            if ball_pos.z < 250 or car_pos.z < 200:
+                return True
+
+            if self.has_reset:
+                self.phase = 2
+                self.timer = 0
+
+        elif self.phase == 2:
+            if 0.03 < self.timer < 0.15:
+                bot.controller.jump = True
+                bot.controller.pitch = -1
+                bot.controller.yaw = random.uniform(-0.3, 0.3)
+
+            if self.timer > 0.18:
+                self.has_reset = False
+                if ball_pos.z > 500 and self.reset_count < 50:
+                    self.phase = 1
+                    self.timer = 0
+                else:
+                    self.phase = 3
+                    self.timer = 0
+
+        elif self.phase == 3:
+            goal_y = 5120 if ball_pos.y > 0 else -5120
+            target = Vec3(0, goal_y, ball_pos.z + 50)
+            self.aerial.steer_toward(bot, car, target)
+            if ball_pos.z < 200 or self.timer > 2:
+                return True
+
+        return False
+
+# ---------- Ground Pinch ----------
+class GroundPinchRoutine:
+    def __init__(self):
+        self.phase = 0
+        self.timer = 0
+
+    def run(self, bot, car, ball):
+        bot.controller = SimpleControllerState()
+        dt = 1/120
+        self.timer += dt
+
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+
+        wall_sign = 1 if ball_pos.x > 0 else -1
+        wall_x = wall_sign * 4096
+
+        if self.phase == 0:
+            target = Vec3(wall_x, ball_pos.y - 900*wall_sign, ball_pos.z)
+            self.drive(bot, car, target, True)
+            if (car_pos - target).length() < 450 or self.timer > 1.8:
+                self.phase = 1
+                self.timer = 0
+
+        elif self.phase == 1:
+            target = Vec3(wall_x, ball_pos.y, 120)
+            self.drive(bot, car, target, True)
+            if (car_pos - ball_pos).length() < 260:
+                bot.controller.jump = True
+                self.phase = 2
+                self.timer = 0
+
+        elif self.phase == 2:
+            if 0.05 < self.timer < 0.20:
+                bot.controller.jump = True
+                bot.controller.pitch = -1
+                bot.controller.boost = True
+            if self.timer > 0.35:
+                return True
+
+        return False
+
+    def drive(self, bot, car, target, boost=False):
+        car_pos = Vec3(car.physics.location)
+        yaw = car.physics.rotation.yaw
+        local = self.to_local(target - car_pos, yaw)
+
+        steer = local.y / max(1, abs(local.y)) if abs(local.y) > 50 else 0
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = boost and abs(steer) < 0.3
+
+    def to_local(self, vec, yaw):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(vec.x*cos_y - vec.y*sin_y, vec.x*sin_y + vec.y*cos_y, vec.z)
+
+# ---------- Power Shot ----------
+class PowerShotRoutine:
+    def __init__(self):
+        self.phase = 0
+        self.timer = 0
+
+    def run(self, bot, car, ball):
+        dt = 1/120
+        self.timer += dt
+        bot.controller.boost = True
+
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+        enemy_goal_y = 5120 if bot.team == 0 else -5120
+        goal = Vec3(0, enemy_goal_y, 200)
+
+        if self.phase == 0:
+            to_goal = (goal - ball_pos).normalize()
+            target = ball_pos - to_goal * 600
+            self.drive(bot, car, target)
+            if (car_pos - target).length() < 300 or self.timer > 1.5:
+                self.phase = 1
+                self.timer = 0
+
+        elif self.phase == 1:
+            self.drive(bot, car, goal)
+            if (car_pos - ball_pos).length() < 220:
+                bot.controller.jump = True
+                bot.controller.pitch = -0.8
+                return True
+
+        return False
+
+    def drive(self, bot, car, target):
+        car_pos = Vec3(car.physics.location)
+        yaw = car.physics.rotation.yaw
+        local = self.to_local(target - car_pos, yaw)
+
+        steer = local.y / max(1, abs(local.y)) if abs(local.y) > 50 else 0
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = abs(steer) < 0.3
+
+    def to_local(self, vec, yaw):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(vec.x*cos_y - vec.y*sin_y, vec.x*sin_y + vec.y*cos_y, vec.z)
+
+# ---------- Pass ----------
+class PassRoutine:
+    def __init__(self):
+        self.target = Vec3(0,0,0)
+
+    def run(self, bot, car, ball):
+        bot.controller.boost = True
+        ball_pos = Vec3(ball.physics.location)
+        self.target = Vec3(0, 2500*(1 if bot.team==1 else -1), 0)
+
+        direction = (self.target - ball_pos).normalize()
+        bot.controller.steer = direction.x
+        bot.controller.throttle = 1
+
+        if abs(ball_pos.y - self.target.y) < 350:
+            bot.controller.jump = True
+            bot.controller.pitch = -1
+            return True
+        return False
+
+# ---------- Recovery ----------
+class Recovery:
+    def run(self, bot, car, ball):
+        car_pos = Vec3(car.physics.location)
+        my_goal_y = -5120 if bot.team == 0 else 5120
+        target = Vec3(0, my_goal_y + sign(my_goal_y)*800, 0)
+
+        yaw = car.physics.rotation.yaw
+        local = self.to_local(target - car_pos, yaw)
+
+        steer = local.y / max(1, abs(local.y)) if abs(local.y) > 50 else 0
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = abs(steer) < 0.3
+        return True
+
+    def to_local(self, vec, yaw):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(vec.x*cos_y - vec.y*sin_y, vec.x*sin_y + vec.y*cos_y, vec.z)
+
+# ---------- Challenge ----------
+class ChallengeRoutine:
+    def __init__(self):
+        self.done = False
+
+    def run(self, bot, car, ball):
+        bot.controller.boost = True
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+
+        self.drive(bot, car, ball_pos)
+
+        if (car_pos - ball_pos).length() < 200:
+            bot.controller.jump = True
+            bot.controller.pitch = -0.5
+            return True
+        return False
+
+    def drive(self, bot, car, target):
+        car_pos = Vec3(car.physics.location)
+        yaw = car.physics.rotation.yaw
+        local = self.to_local(target - car_pos, yaw)
+
+        steer = local.y / max(1, abs(local.y)) if abs(local.y) > 50 else 0
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = abs(steer) < 0.3
+
+    def to_local(self, vec, yaw):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(vec.x*cos_y - vec.y*sin_y, vec.x*sin_y + vec.y*cos_y, vec.z)
+
+# ---------- Behavior Manager ----------
+class BehaviorManager:
+    def choose(self, bot, car, ball):
+        ball_pos = Vec3(ball.physics.location)
+        car_pos = Vec3(car.physics.location)
+
+        team = bot.team
+        my_goal_y = -5120 if team == 0 else 5120
+        enemy_goal_y = 5120 if team == 0 else -5120
+
+        dist_to_ball = (car_pos - ball_pos).length()
+        dist_ball_to_my_goal = abs(ball_pos.y - my_goal_y)
+        dist_ball_to_enemy_goal = abs(ball_pos.y - enemy_goal_y)
+        z_ball = ball_pos.z
+
+        if dist_ball_to_my_goal < 2000 and z_ball < 400:
+            return ChallengeRoutine()
+
+        if dist_ball_to_enemy_goal < 3500:
+            if z_ball > 350 and dist_to_ball < 2500:
+                return FlipResetFreestylerRoutine()
+            if z_ball < 300:
+                return PowerShotRoutine()
+
+        if abs(ball_pos.x) > 3400 and z_ball < 220:
+            return GroundPinchRoutine()
+
+        if z_ball > 350 and dist_to_ball < 3000:
+            return FlipResetFreestylerRoutine()
+
+        if dist_to_ball > 3500:
+            return Recovery()
+
+        if random.random() < 0.3:
+            return PassRoutine()
+        return ChallengeRoutine()
+
+# ---------- Main Bot ----------
+class MyFreestyleBot(BaseAgent):
+    def initialize_agent(self):
+        self.controller = SimpleControllerState()
+        self.behavior = BehaviorManager()
+        self.active = None
+        random.seed()
+
+    def get_output(self, packet):
+        car = packet.game_cars[self.index]
+        ball = packet.game_ball
+
+        if self.active:
+            done = self.active.run(self, car, ball)
+            if done:
+                self.active = None
+            return self.controller
+
+        self.active = self.behavior.choose(self, car, ball)
+        return self.controller
