@@ -1,0 +1,443 @@
+from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
+import math
+import random
+
+
+# ---------- Vec3 helper ----------
+
+class Vec3:
+    def __init__(self, x=0, y=0, z=0):
+        if hasattr(x, 'x'):
+            self.x = x.x
+            self.y = x.y
+            self.z = x.z
+        else:
+            self.x = x
+            self.y = y
+            self.z = z
+
+    def __sub__(self, other):
+        return Vec3(self.x - other.x, self.y - other.y, self.z - other.z)
+
+    def __add__(self, other):
+        return Vec3(self.x + other.x, self.y + other.y, self.z + other.z)
+
+    def __mul__(self, val):
+        return Vec3(self.x * val, self.y * val, self.z * val)
+
+    def dot(self, other):
+        return self.x * other.x + self.y * other.y + self.z * other.z
+
+    def length(self):
+        return math.sqrt(self.x * self.x + self.y * self.y + self.z * self.z)
+
+    def normalize(self):
+        l = self.length()
+        if l == 0:
+            return Vec3(0, 0, 0)
+        return Vec3(self.x / l, self.y / l, self.z / l)
+
+
+# ---------- Utility ----------
+
+def sign(x):
+    return 1 if x >= 0 else -1
+
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+# ---------- Aerial controller ----------
+
+class AerialController:
+    def steer_toward(self, bot, car, target: Vec3):
+        car_pos = Vec3(car.physics.location)
+        car_rot = car.physics.rotation
+        car_yaw = car_rot.yaw
+        car_pitch = car_rot.pitch
+        car_roll = car_rot.roll
+
+        to_target = (target - car_pos).normalize()
+
+        desired_yaw = math.atan2(to_target.y, to_target.x)
+        desired_pitch = math.atan2(to_target.z, math.sqrt(to_target.x**2 + to_target.y**2))
+
+        yaw_error = (desired_yaw - car_yaw + math.pi) % (2 * math.pi) - math.pi
+        pitch_error = (desired_pitch - car_pitch + math.pi) % (2 * math.pi) - math.pi
+
+        bot.controller.yaw = clamp(yaw_error * 2.0, -1, 1)
+        bot.controller.pitch = clamp(-pitch_error * 2.0, -1, 1)
+        bot.controller.roll = clamp(-car_roll * 1.5, -1, 1)
+
+
+# ---------- Core routines ----------
+
+class FlipResetFreestylerRoutine:
+    def __init__(self):
+        self.phase = 0
+        self.timer = 0.0
+        self.has_reset = False
+        self.reset_count = 0
+        self.aerial = AerialController()
+
+    def run(self, bot, car, ball):
+        dt = 1 / 120
+        self.timer += dt
+        bot.controller.boost = True
+
+        ball_pos = Vec3(ball.physics.location)
+        car_pos = Vec3(car.physics.location)
+
+        # Phase 0: go up for ball
+        if self.phase == 0:
+            target = Vec3(ball_pos.x, ball_pos.y, ball_pos.z - 80)
+            self.aerial.steer_toward(bot, car, target)
+            if ball_pos.z > 400 and car_pos.z > 200:
+                self.phase = 1
+                self.timer = 0.0
+
+        # Phase 1: get underside and look for reset
+        elif self.phase == 1:
+            target = Vec3(ball_pos.x, ball_pos.y, ball_pos.z - 60)
+            self.aerial.steer_toward(bot, car, target)
+
+            dist = (ball_pos - car_pos).length()
+            if not self.has_reset and dist < 120:
+                self.has_reset = True
+                self.reset_count += 1
+                self.timer = 0.0
+
+            if ball_pos.z < 250 or car_pos.z < 200:
+                return True
+
+            if self.has_reset:
+                self.phase = 2
+                self.timer = 0.0
+
+        # Phase 2: use flip, then try to air dribble / chain
+        elif self.phase == 2:
+            if 0.03 < self.timer < 0.15:
+                bot.controller.jump = True
+                bot.controller.pitch = -1
+                bot.controller.yaw = random.uniform(-0.3, 0.3)
+
+            if self.timer > 0.18:
+                self.has_reset = False
+                if ball_pos.z > 500 and self.reset_count < 50:
+                    self.phase = 1
+                    self.timer = 0.0
+                else:
+                    self.phase = 3
+                    self.timer = 0.0
+
+        # Phase 3: simple air dribble toward goal
+        elif self.phase == 3:
+            goal_y = 5120 if ball_pos.y > 0 else -5120
+            target = Vec3(0, goal_y, ball_pos.z + 50)
+            self.aerial.steer_toward(bot, car, target)
+            if ball_pos.z < 200 or self.timer > 2.0:
+                return True
+
+        return False
+
+
+class GroundPinchRoutine:
+    def __init__(self):
+        self.phase = 0
+        self.timer = 0.0
+
+    def run(self, bot, car, ball):
+        bot.controller = SimpleControllerState()
+        dt = 1 / 120
+        self.timer += dt
+
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+
+        wall_sign = 1 if ball_pos.x > 0 else -1
+        wall_x = wall_sign * 4096
+
+        if self.phase == 0:
+            target_behind = Vec3(wall_x, ball_pos.y - 900 * wall_sign, ball_pos.z)
+            self.drive_toward(bot, car, target_behind, boost=True)
+            if (car_pos - target_behind).length() < 450 or self.timer > 1.8:
+                self.phase = 1
+                self.timer = 0.0
+
+        elif self.phase == 1:
+            target_hit = Vec3(wall_x, ball_pos.y, 120)
+            self.drive_toward(bot, car, target_hit, boost=True)
+            if (car_pos - ball_pos).length() < 260:
+                bot.controller.jump = True
+                self.phase = 2
+                self.timer = 0.0
+
+        elif self.phase == 2:
+            if 0.05 < self.timer < 0.20:
+                bot.controller.jump = True
+                bot.controller.pitch = -1
+                bot.controller.boost = True
+            if self.timer > 0.35:
+                return True
+
+        return False
+
+    def drive_toward(self, bot, car, target: Vec3, boost=False):
+        car_pos = Vec3(car.physics.location)
+        yaw = car.physics.rotation.yaw
+
+        local = self.world_to_local(target - car_pos, yaw)
+        steer = 0.0
+        if abs(local.y) > 50:
+            steer = local.y / max(1, abs(local.y))
+
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = boost and abs(steer) < 0.3
+
+    def world_to_local(self, vec: Vec3, yaw: float):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(
+            vec.x * cos_y - vec.y * sin_y,
+            vec.x * sin_y + vec.y * cos_y,
+            vec.z
+        )
+
+
+class PowerShotRoutine:
+    def __init__(self):
+        self.phase = 0
+        self.timer = 0.0
+
+    def run(self, bot, car, ball):
+        dt = 1 / 120
+        self.timer += dt
+        bot.controller.boost = True
+
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+        goal_y = 5120 if bot.team == 0 else -5120  # shoot at enemy goal
+        goal = Vec3(0, goal_y, 200)
+
+        if self.phase == 0:
+            # get behind ball relative to goal
+            to_goal = (goal - ball_pos).normalize()
+            target = ball_pos - to_goal * 600
+            self.drive_toward(bot, car, target)
+            if (car_pos - target).length() < 300 or self.timer > 1.5:
+                self.phase = 1
+                self.timer = 0.0
+
+        elif self.phase == 1:
+            self.drive_toward(bot, car, goal)
+            if (car_pos - ball_pos).length() < 220:
+                bot.controller.jump = True
+                bot.controller.pitch = -0.8
+                return True
+
+        return False
+
+    def drive_toward(self, bot, car, target: Vec3):
+        car_pos = Vec3(car.physics.location)
+        yaw = car.physics.rotation.yaw
+
+        local = self.world_to_local(target - car_pos, yaw)
+        steer = 0.0
+        if abs(local.y) > 50:
+            steer = local.y / max(1, abs(local.y))
+
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = abs(steer) < 0.3
+
+    def world_to_local(self, vec: Vec3, yaw: float):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(
+            vec.x * cos_y - vec.y * sin_y,
+            vec.x * sin_y + vec.y * cos_y,
+            vec.z
+        )
+
+
+class PassRoutine:
+    def __init__(self):
+        self.target_point = Vec3(0, 0, 0)
+
+    def run(self, bot, car, ball):
+        bot.controller.boost = True
+        ball_pos = Vec3(ball.physics.location)
+
+        # pass toward center of enemy half
+        goal_y = 0 if bot.team == 0 else 0
+        self.target_point = Vec3(0, sign(-bot.team + 0.5) * 2500, 0)
+
+        direction = (self.target_point - ball_pos).normalize()
+        bot.controller.steer = direction.x
+        bot.controller.throttle = 1
+
+        if abs(ball_pos.y - self.target_point.y) < 350:
+            bot.controller.jump = True
+            bot.controller.pitch = -1
+            return True
+
+        return False
+
+
+class Recovery:
+    def run(self, bot, car, ball):
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+        goal_y = -5120 if bot.team == 0 else 5120  # own goal for defense
+
+        # drive toward own goal if out of position
+        target = Vec3(0, goal_y + sign(goal_y) * 800, 0)
+        car_yaw = car.physics.rotation.yaw
+        local = self.world_to_local(target - car_pos, car_yaw)
+
+        steer = 0.0
+        if abs(local.y) > 50:
+            steer = local.y / max(1, abs(local.y))
+
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = abs(steer) < 0.3
+        return True
+
+    def world_to_local(self, vec: Vec3, yaw: float):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(
+            vec.x * cos_y - vec.y * sin_y,
+            vec.x * sin_y + vec.y * cos_y,
+            vec.z
+        )
+
+
+# ---------- Defense / challenge logic ----------
+
+class ChallengeRoutine:
+    def __init__(self):
+        self.done = False
+
+    def run(self, bot, car, ball):
+        bot.controller.boost = True
+        car_pos = Vec3(car.physics.location)
+        ball_pos = Vec3(ball.physics.location)
+
+        # simple straight challenge
+        self.drive_toward(bot, car, ball_pos)
+
+        if (car_pos - ball_pos).length() < 200:
+            bot.controller.jump = True
+            bot.controller.pitch = -0.5
+            self.done = True
+            return True
+
+        return False
+
+    def drive_toward(self, bot, car, target: Vec3):
+        car_pos = Vec3(car.physics.location)
+        yaw = car.physics.rotation.yaw
+
+        local = self.world_to_local(target - car_pos, yaw)
+        steer = 0.0
+        if abs(local.y) > 50:
+            steer = local.y / max(1, abs(local.y))
+
+        bot.controller.throttle = 1
+        bot.controller.steer = steer
+        bot.controller.boost = abs(steer) < 0.3
+
+    def world_to_local(self, vec: Vec3, yaw: float):
+        cos_y = math.cos(-yaw)
+        sin_y = math.sin(-yaw)
+        return Vec3(
+            vec.x * cos_y - vec.y * sin_y,
+            vec.x * sin_y + vec.y * cos_y,
+            vec.z
+        )
+
+
+# ---------- Behavior manager (offense + defense) ----------
+
+class BehaviorManager:
+    def choose_routine(self, bot, car, ball):
+        ball_loc = Vec3(ball.physics.location.x,
+                        ball.physics.location.y,
+                        ball.physics.location.z)
+        car_loc = Vec3(car.physics.location.x,
+                       car.physics.location.y,
+                       car.physics.location.z)
+
+        team = bot.team
+        my_goal_y = -5120 if team == 0 else 5120
+        enemy_goal_y = 5120 if team == 0 else -5120
+
+        # Distances
+        dist_to_ball = (car_loc - ball_loc).length()
+        dist_ball_to_my_goal = abs(ball_loc.y - my_goal_y)
+        dist_ball_to_enemy_goal = abs(ball_loc.y - enemy_goal_y)
+
+        # Ball height
+        z_ball = ball_loc.z
+
+        # DEFENSE: ball close to our goal -> challenge
+        if dist_ball_to_my_goal < 2000 and z_ball < 400:
+            return ChallengeRoutine()
+
+        # OFFENSE: ball near enemy half
+        if dist_ball_to_enemy_goal < 3500:
+            # high ball -> freestyler
+            if z_ball > 350 and dist_to_ball < 2500:
+                return FlipResetFreestylerRoutine()
+            # low ball -> power shot
+            if z_ball < 300:
+                return PowerShotRoutine()
+
+        # SIDE / WALL: ground pinch chance
+        if abs(ball_loc.x) > 3400 and z_ball < 220:
+            return GroundPinchRoutine()
+
+        # MIDFIELD high ball -> freestyler
+        if z_ball > 350 and dist_to_ball < 3000:
+            return FlipResetFreestylerRoutine()
+
+        # If far from ball, rotate back / recover
+        if dist_to_ball > 3500:
+            return Recovery()
+
+        # Otherwise, sometimes pass, sometimes challenge
+        if random.random() < 0.3:
+            return PassRoutine()
+        else:
+            return ChallengeRoutine()
+
+
+# ---------- Main bot ----------
+
+class MyFreestyleBot(BaseAgent):
+
+    def initialize_agent(self):
+        self.controller = SimpleControllerState()
+        self.behavior = BehaviorManager()
+        self.active_routine = None
+        random.seed()
+
+    def get_output(self, packet):
+        car = packet.game_cars[self.index]
+        ball = packet.game_ball
+
+        if self.active_routine:
+            done = self.active_routine.run(self, car, ball)
+            if done:
+                self.active_routine = None
+            return self.controller
+
+        self.active_routine = self.behavior.choose_routine(self, car, ball)
+        return self.controller
+        user.bypass_easy_anti_cheat 
+        project_online_chain_reaction_competitive
+        unbannable-true
