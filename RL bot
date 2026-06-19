@@ -1,0 +1,58 @@
+pythonfrom rlbot.agents.base_agent import BaseAgent, SimpleControllerState
+from rlbot.utils.structures.game_data_struct import GameTickPacket
+import math
+
+class CombinedProfessionalBot(BaseAgent):
+    def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
+        controller = SimpleControllerState()
+        
+        # 1. Gather Data
+        my_car = packet.game_cars[self.index]
+        car_location = my_car.physics.location
+        ball_location = packet.game_ball.physics.location
+        my_boost = my_car.boost
+
+        # 2. Kickoff State: If the ball is dead center, go full speed
+        if ball_location.x == 0 and ball_location.y == 0:
+            return self.execute_kickoff(controller)
+
+        # 3. Resource Management: If boost is very low, prioritize survival
+        if my_boost < 10:
+            return self.get_boost_logic(packet, controller)
+
+        # 4. Advanced Ball Prediction (The "Unstoppable" part)
+        prediction = self.get_ball_prediction_struct()
+        if prediction is not None:
+            # Look 1.5 seconds into the future (slice 180)
+            future_slice = prediction.slices[180]
+            target = future_slice.physics.location
+            
+            # Simple steering toward future target
+            angle = math.atan2(target.y - car_location.y, target.x - car_location.x)
+            car_angle = my_car.physics.rotation.yaw
+            steer_value = angle - car_angle
+            
+            # Normalize angle to keep it between -pi and pi
+            if steer_value > math.pi: steer_value -= 2 * math.pi
+            if steer_value < -math.pi: steer_value += 2 * math.pi
+            
+            controller.steer = max(-1, min(1, steer_value * 5))
+            controller.throttle = 1.0
+            
+            # Only boost if we are facing the ball and it's far away
+            if abs(steer_value) < 0.2 and my_boost > 20:
+                controller.boost = True
+
+        return controller
+
+    def execute_kickoff(self, controller):
+        controller.throttle = 1.0
+        controller.boost = True
+        return controller
+
+    def get_boost_logic(self, packet, controller):
+        # Professional bots find the nearest active boost pad
+        # For now, we'll just slow down to maintain control
+        controller.throttle = 0.5
+        controller.boost = False
+        return controller
